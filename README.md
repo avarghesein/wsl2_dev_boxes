@@ -12,7 +12,7 @@ A blueprint is a version-controlled definition of a Linux development environmen
 
 - Spin up a prebuilt Linux environment quickly instead of repeating manual setup.
 - Keep project dependencies isolated so one project does not disturb another.
-- Give a team the same starting environment through Dockerfiles, dependency files, and configuration stored with the repository.
+- Give a team the same starting environment through `Containerfile`s with familiar Dockerfile syntax, dependency files, and configuration stored with the repository.
 - Keep a shared base environment and build specialized boxes on top of it.
 - Recreate a container after changing ports or mounted folders without reinstalling all packages.
 
@@ -29,13 +29,17 @@ Each box has its own image, container, ports, and configuration, while still usi
 
 - **Reusable blueprints** for fast, consistent Linux DevBox creation.
 - **Multiple project environments** on one Windows machine.
-- **Windows folder access** through bind mounts, for example `/mnt/c/your-project` inside a container.
+- **A default WSL workspace mount** from the Ubuntu user's home, with optional Windows-folder bind mounts such as `/mnt/c/your-project`.
 - **Container port publishing** so applications in a DevBox are reachable from Windows at `localhost:<port>`.
 - **Host service access** so a DevBox can call services running in Ubuntu WSL or on Windows by IP address and port.
 - **SSH and VS Code Remote-SSH** so Windows provides the editor and terminal while development runs in Linux.
-- **Persistent workspaces and containers configured to restart when Docker starts** for a practical day-to-day development experience.
+- **Persistent workspaces and containers configured to start with Ubuntu WSL** for a practical day-to-day development experience.
 
-Docker CE runs inside the default Ubuntu WSL2 distribution. Docker Desktop is not used.
+**Rootless Podman is the container runtime** inside the default Ubuntu WSL2 distribution. Docker Desktop is not used. Managed containers start through the user's systemd services when Ubuntu WSL starts; no `.bashrc` hook is required.
+
+Podman runs Docker-compatible OCI images from Docker Hub, GitHub Container Registry, Quay, and other registries. Use a fully qualified image reference such as `docker.io/library/ubuntu:24.04` in a `Containerfile`. Existing Dockerfile instructions can generally be used in the project's `Containerfile`.
+
+On Ubuntu, the `podman-docker` compatibility package makes `docker` invoke Podman. Inside DevBoxes, both `podman` and `docker` connect to the same rootless Podman engine through the Ubuntu user's socket at `/run/podman/podman.sock`. No Docker Engine or Docker daemon is installed or used.
 
 ## How to get it running
 
@@ -47,7 +51,7 @@ Docker CE runs inside the default Ubuntu WSL2 distribution. Docker Desktop is no
 - PowerShell run as Administrator for the first command.
 - A lowercase Linux username, such as `devuser`.
 
-You do not need WSL, Ubuntu, or Docker CE preinstalled. Host mode installs and configures them when they are missing.
+You do not need WSL, Ubuntu, or Podman preinstalled. Host mode installs and configures them when they are missing.
 
 ### 1. Prepare the Windows host
 
@@ -58,9 +62,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup-wsl-dev-environment.ps1 -Mode Host -UserName "devuser"
 ```
 
-Host mode enables WSL2 when necessary, installs the default `Ubuntu` distribution, enables systemd, and installs Docker CE inside Ubuntu.
+Host mode enables WSL2 when necessary, installs the default `Ubuntu` distribution, enables systemd, and installs rootless Podman and its support packages. If Windows needs a restart to finish enabling WSL, the script asks before restarting; after Windows starts, run Host mode again.
 
-When the command completes, close the current PowerShell window and every Ubuntu terminal. Open a new **PowerShell as Administrator** before creating a box. This gives WSL and the Linux user session a clean start.
+When Host mode completes, close the current PowerShell window and every Ubuntu terminal. Open a new **PowerShell as Administrator** before creating a box. This gives WSL and the Linux user session a clean start.
 
 To opt in to sparse VHD storage:
 
@@ -100,7 +104,7 @@ For VS Code, install the **Remote Development** extension pack on Windows:
 
 The folder name is exact and becomes the logical box name:
 
-- `finance_analytics_box/` creates image `finance_analytics_box:latest` and default container `finance_analytics_box`.
+- `finance_analytics_box/` creates image `localhost/finance_analytics_box:latest` and default container `finance_analytics_box`.
 - `finance-analytics-box/` preserves hyphens in the same way.
 - `core_box` is reserved for the shared foundation; do not pass `-Box core_box`.
 
@@ -110,8 +114,8 @@ The Core DevBox is intentionally shared and reusable. The Extended DevBox demons
 
 | Mode | When to use it | Command |
 | --- | --- | --- |
-| **Host** | First-time Windows, WSL2, Ubuntu, and Docker CE setup. | `.\setup-wsl-dev-environment.ps1 -Mode Host -UserName "devuser"` |
-| **Box** | Build a box image and start its default container. Use after Dockerfile or dependency changes. | `.\setup-wsl-dev-environment.ps1 -Mode Box -Box extended_box -UserName "devuser"` |
+| **Host** | First-time Windows, WSL2, Ubuntu, and rootless Podman setup. | `.\setup-wsl-dev-environment.ps1 -Mode Host -UserName "devuser"` |
+| **Box** | Build a box image and start its default container. Use after `Containerfile` or dependency changes. | `.\setup-wsl-dev-environment.ps1 -Mode Box -Box extended_box -UserName "devuser"` |
 | **Update** | Recreate a container after `config.json` port or bind-mount changes. The existing image is reused. | `.\setup-wsl-dev-environment.ps1 -Mode Update -Box extended_box -UserName "devuser"` |
 | **Remove** | Remove a box container, its named instances, and its image. Confirmation is requested. | `.\setup-wsl-dev-environment.ps1 -Mode Remove -Box extended_box -UserName "devuser"` |
 
@@ -139,7 +143,7 @@ Each blueprint has a `config.json` file. It controls its SSH port, application p
 }
 ```
 
-Use absolute Linux paths for bind mounts. A Windows folder must use its WSL path, such as `/mnt/c/Users/devuser/projects`, and must already exist inside Ubuntu WSL. The target is the path visible inside the container.
+The default `/wsl/shared` workspace comes from the Ubuntu WSL user's home directory. Use absolute Linux paths for additional bind mounts. A Windows folder must use its WSL path, such as `/mnt/c/Users/devuser/projects`, and must already exist inside Ubuntu WSL. The target is the path visible inside the container.
 
 For every non-core box, mounts are combined from `core_box/config.json` and the box's own `config.json`. A named instance adds its own mounts from `instances/<name>/config.json`.
 
@@ -147,7 +151,7 @@ Published ports are available from Windows through `localhost:<port>`. For examp
 
 From a DevBox:
 
-- Reach a service in the parent Ubuntu WSL distribution at `host.docker.internal:<port>`.
+- Reach a service in the parent Ubuntu WSL distribution at `host.containers.internal:<port>`.
 - Reach a service on the Windows host using the Windows host IP address and its port.
 
 After changing ports or mounts, run Update mode:
@@ -158,7 +162,7 @@ After changing ports or mounts, run Update mode:
 
 ## Create a project-specific box
 
-Copy the example blueprint, give it a clear project name, and customize its Dockerfile and configuration:
+Copy the example blueprint, give it a clear project name, and customize its `Containerfile` and configuration:
 
 ```powershell
 Copy-Item -Recurse .\extended_box .\finance_analytics_box
@@ -167,7 +171,7 @@ Copy-Item -Recurse .\extended_box .\finance_analytics_box
 
 Then edit:
 
-- `Dockerfile` for project dependencies and build steps.
+- `Containerfile` for project dependencies and build steps. Dockerfile instructions can generally be reused.
 - `config.json` for SSH, application ports, and bind mounts.
 - Optional startup and dependency files for project-specific behavior.
 
@@ -181,7 +185,7 @@ Use an instance when you need another running container from the same image, usu
 .\setup-wsl-dev-environment.ps1 -Mode Box -Box extended_box -Instance secondary -UserName "devuser"
 ```
 
-The example instance configuration is `extended_box/instances/secondary/config.json`. It produces container and SSH alias `extended_box-secondary` while reusing the `extended_box:latest` image.
+The example instance configuration is `extended_box/instances/secondary/config.json`. It produces container and SSH alias `extended_box-secondary` while reusing the `localhost/extended_box:latest` image.
 
 ## Important files
 
@@ -198,7 +202,7 @@ The example instance configuration is `extended_box/instances/secondary/config.j
 | Problem | What to do |
 | --- | --- |
 | Box mode shows a systemd user-session warning after Host mode. | Close PowerShell and Ubuntu terminals, open a fresh elevated PowerShell, and rerun the Box command. |
-| `docker` is unavailable in Ubuntu. | Run `wsl --shutdown` from PowerShell, then rerun Host mode. |
+| `podman` or Docker-compatible `docker` is unavailable in Ubuntu. | Run `wsl --shutdown` from PowerShell, then rerun Host mode. |
 | A published port is already in use. | Change the host-side port in `config.json` and run Update mode. |
 | A bind mount fails. | Confirm the `source` path exists inside Ubuntu WSL and uses a Linux path such as `/mnt/c/...`. |
 | WSL or sparse-VHD conversion is still running. | Wait a few minutes, run `wsl --update` if needed, then rerun Host mode. |

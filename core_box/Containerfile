@@ -1,0 +1,73 @@
+FROM docker.io/library/ubuntu:24.04
+
+ARG USERNAME=devuser
+ARG UID=1000
+ARG GID=1000
+
+ENV USERNAME=${USERNAME}
+ENV CONTAINER_HOST=unix:///run/podman/podman.sock
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    htop \
+    iputils-ping \
+    net-tools \
+    openssh-server \
+    podman \
+    podman-docker \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    rsync \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY podman-remote /usr/local/bin/podman
+RUN chmod 0755 /usr/local/bin/podman && \
+    ln -sf /usr/local/bin/podman /usr/local/bin/docker
+
+RUN set -eu; \
+    if getent group "${USERNAME}" >/dev/null 2>&1; then \
+        existing_group_gid="$(getent group "${USERNAME}" | cut -d: -f3)"; \
+        if [ "${existing_group_gid}" != "${GID}" ]; then \
+            echo "ERROR: Image group '${USERNAME}' already exists with GID ${existing_group_gid}, expected ${GID}." >&2; \
+            exit 1; \
+        fi; \
+    elif getent group "${GID}" >/dev/null 2>&1; then \
+        groupadd --non-unique --gid "${GID}" "${USERNAME}"; \
+    else \
+        groupadd --gid "${GID}" "${USERNAME}"; \
+    fi; \
+    if getent passwd "${USERNAME}" >/dev/null 2>&1; then \
+        existing_uid="$(getent passwd "${USERNAME}" | cut -d: -f3)"; \
+        if [ "${existing_uid}" != "${UID}" ]; then \
+            if getent passwd "${UID}" >/dev/null 2>&1; then \
+                echo "ERROR: UID ${UID} is already assigned to another image user." >&2; \
+                exit 1; \
+            fi; \
+            usermod --uid "${UID}" --gid "${USERNAME}" --home "/home/${USERNAME}" --move-home --shell /bin/bash "${USERNAME}"; \
+        else \
+            usermod --gid "${USERNAME}" --home "/home/${USERNAME}" --move-home --shell /bin/bash "${USERNAME}"; \
+        fi; \
+    elif getent passwd "${UID}" >/dev/null 2>&1; then \
+        existing_user="$(getent passwd "${UID}" | cut -d: -f1)"; \
+        usermod --login "${USERNAME}" --gid "${USERNAME}" --home "/home/${USERNAME}" --move-home --shell /bin/bash "${existing_user}"; \
+    else \
+        useradd --create-home --uid "${UID}" --gid "${USERNAME}" --shell /bin/bash "${USERNAME}"; \
+    fi; \
+    usermod --append --groups sudo "${USERNAME}" && \
+    install -d -m 0755 /etc/sudoers.d && \
+    printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${USERNAME}" > "/etc/sudoers.d/${USERNAME}" && \
+    chmod 0440 "/etc/sudoers.d/${USERNAME}" && \
+    install -d -o "${USERNAME}" -g "${USERNAME}" -m 0700 "/home/${USERNAME}/.ssh"
+
+RUN install -d -m 0755 /run/sshd && \
+    install -d -m 0755 /run/podman /run/wsl-devbox && \
+    printf '\nPubkeyAuthentication yes\nAuthorizedKeysFile .ssh/authorized_keys\nPasswordAuthentication no\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
+
+COPY start-core-devbox.sh /start-core-devbox.sh
+RUN chmod 0755 /start-core-devbox.sh
+
+ENTRYPOINT ["/start-core-devbox.sh"]

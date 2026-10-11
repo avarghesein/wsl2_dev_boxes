@@ -1,0 +1,26 @@
+FROM localhost/core_box:latest
+
+ARG USERNAME=devuser
+
+ENV USERNAME=${USERNAME}
+
+RUN install -d -o "${USERNAME}" -g "${USERNAME}" -m 0755 /wsl/envs && \
+    chmod a+rw /wsl/envs
+
+USER ${USERNAME}
+
+COPY python-requirements.txt /wsl/envs/extended.requirements.txt
+
+RUN python3 -m venv /wsl/envs/extended && \
+    /bin/bash -c "source /wsl/envs/extended/bin/activate && \
+    pip install --upgrade pip && \
+    pip install -r /wsl/envs/extended.requirements.txt"
+
+USER root
+
+RUN printf 'extended_box\n' > /etc/hostname
+
+COPY start_extended_devbox.sh /start_extended_devbox.sh
+RUN chmod 0755 /start_extended_devbox.sh
+
+ENTRYPOINT ["/start_extended_devbox.sh"]

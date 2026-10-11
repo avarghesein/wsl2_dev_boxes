@@ -20,16 +20,21 @@ param (
 
     [switch]$EnableSparseVhd,
 
-    [switch]$EnableSystemd,
-
-    [switch]$DisableSparseVhd,
-
-    [switch]$DisableSystemd
+    [switch]$DisableSparseVhd
 )
 
 $ErrorActionPreference = "Stop"
+$script:HostRestartDeclined = $false
 $wslDistro = "Ubuntu"
-$scriptDir = (Resolve-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition)).Path
+$scriptDir = (Resolve-Path $PSScriptRoot).Path
+$projectLeaf = [regex]::Replace((Split-Path -Leaf $scriptDir), '[^A-Za-z0-9._-]', '_')
+$pathHasher = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $pathDigest = [BitConverter]::ToString($pathHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($scriptDir))).Replace("-", "").Substring(0, 8).ToLowerInvariant()
+} finally {
+    $pathHasher.Dispose()
+}
+$projectName = "$projectLeaf-$pathDigest"
 
 function Write-Status {
     param([Parameter(Mandatory=$true)][string]$Message)
@@ -53,23 +58,99 @@ function Complete-RetryProgress {
     Write-Progress -Id 7 -Activity "Waiting for WSL" -Completed
 }
 
+function Confirm-WindowsRestart {
+    param([Parameter(Mandatory=$true)][string]$Reason)
+
+    Write-Status $Reason
+    $answer = Read-Host "Restart Windows now? [y/N]"
+    if ($answer -notmatch '^(?i:y|yes)$') {
+        $script:HostRestartDeclined = $true
+        Write-Status "Restart declined. Host setup is paused; restart Windows and run Host mode again when ready."
+        return $false
+    }
+
+    Write-Status "Restart confirmed. Restarting Windows now. After Windows starts, run Host mode again to continue setup."
+    Restart-Computer -ErrorAction Stop
+    exit 0
+}
+
+function Test-WindowsRestartRequired {
+    param([string[]]$Output)
+
+    $outputText = $Output -join "`n"
+    return $outputText -match '(?i)changes will not be effective until (?:the )?system is rebooted|restart (?:is )?required|reboot (?:is )?required'
+}
+
+function Invoke-WslNative {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [switch]$StreamOutput
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $output = @()
+    $exitCode = 1
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = @(& wsl.exe @Arguments 2>&1 | ForEach-Object {
+            $line = $_.ToString() -replace "`0", ""
+            if ($StreamOutput) {
+                [Console]::Out.WriteLine($line)
+            }
+            $line
+        })
+        $exitCode = $LASTEXITCODE
+    } catch {
+        $output += ($_.Exception.Message -replace "`0", "")
+        if ($null -ne $LASTEXITCODE) {
+            $exitCode = $LASTEXITCODE
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = [string[]]$output
+    }
+}
+
 function Get-WslPath {
     param([Parameter(Mandatory=$true)][string]$WindowsPath)
 
     # Forward slashes prevent WSL argument parsing from stripping Windows
     # backslash separators before wslpath receives the path.
     $wslPathInput = $WindowsPath -replace '\\', '/'
-    $wslPathOutput = & wsl.exe --distribution $wslDistro -- wslpath -a $wslPathInput 2>$null
-    $wslExitCode = $LASTEXITCODE
-    $wslPath = if ($null -ne $wslPathOutput) { ($wslPathOutput -join "`n").Trim() } else { "" }
-    if ($wslExitCode -ne 0 -or -not $wslPath) {
+    $wslResult = Invoke-WslNative -Arguments @("--distribution", $wslDistro, "--", "wslpath", "-a", $wslPathInput)
+    $wslPath = ($wslResult.Output -join "`n").Trim()
+    if ($wslResult.ExitCode -ne 0 -or -not $wslPath) {
         throw "Could not convert Windows path to a WSL path: $WindowsPath"
     }
     return $wslPath
 }
 
+function Get-WslHomePath {
+    param([Parameter(Mandatory=$true)][string]$LinuxUser)
+
+    $wslResult = Invoke-WslNative -Arguments @("--distribution", $wslDistro, "--user", $LinuxUser, "--", "getent", "passwd", $LinuxUser)
+    $passwdEntry = $wslResult.Output
+    if ($wslResult.ExitCode -ne 0 -or -not $passwdEntry) {
+        throw "Could not find the Ubuntu WSL home directory for '$LinuxUser'. Run Host mode first."
+    }
+
+    $fields = ($passwdEntry -join "").Split(':')
+    if ($fields.Count -lt 6 -or -not $fields[5].StartsWith('/')) {
+        throw "Ubuntu returned an invalid home directory for '$LinuxUser'."
+    }
+    return $fields[5]
+}
+
 function Get-InstalledDistro {
-    return wsl.exe --list --quiet 2>$null |
+    $wslResult = Invoke-WslNative -Arguments @("--list", "--quiet")
+    if ($wslResult.ExitCode -ne 0) {
+        return $null
+    }
+    return $wslResult.Output |
         ForEach-Object { ($_ -replace "`0", "").Trim() } |
         Where-Object { $_ -eq $wslDistro } |
         Select-Object -First 1
@@ -98,33 +179,40 @@ function Invoke-WslScript {
     param(
         [Parameter(Mandatory=$true)][string]$Script,
         [string[]]$Arguments = @(),
-        [switch]$AsRoot
+        [switch]$AsRoot,
+        [string]$LinuxUser
     )
 
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Script))
+    # PowerShell scripts checked out on Windows commonly use CRLF. Bash treats
+    # the carriage return as part of each command, so send LF-only script text
+    # through the WSL stdin handoff.
+    $normalizedScript = $Script.Replace("`r`n", "`n").Replace("`r", "`n")
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($normalizedScript))
     $userArgs = @()
     if ($AsRoot) {
         $userArgs = @("--user", "root")
+    } elseif ($LinuxUser) {
+        $userArgs = @("--user", $LinuxUser)
     }
 
     $argumentText = "echo $encoded | base64 -d | bash -s --"
     foreach ($argument in $Arguments) {
-        $argumentText += " '$argument'"
+        $quotedArgument = "'" + $argument.Replace("'", "'\''") + "'"
+        $argumentText += " $quotedArgument"
     }
 
-    & wsl.exe --distribution $wslDistro @userArgs -- bash -lc $argumentText 2>&1 |
-        ForEach-Object {
-            $line = $_.ToString()
-            $line = $line -replace "`r", ""
-            $line = $line -replace "`e\[[0-9;?]*[ -/]*[@-~]", ""
-            $line = $line -replace "[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", ""
-            $line = $line.Trim()
-            if ($line.Length -gt 0) {
-                [Console]::Out.WriteLine("[Ubuntu] $line")
-            }
+    $wslArguments = @("--distribution", $wslDistro) + $userArgs + @("--", "bash", "-lc", $argumentText)
+    $wslResult = Invoke-WslNative -Arguments $wslArguments
+    foreach ($outputLine in $wslResult.Output) {
+        $line = $outputLine -replace "`r", ""
+        $line = $line -replace "`e\[[0-9;?]*[ -/]*[@-~]", ""
+        $line = $line -replace "[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", ""
+        $line = $line.Trim()
+        if ($line.Length -gt 0) {
+            [Console]::Out.WriteLine("[Ubuntu] $line")
         }
-    $wslExitCode = $LASTEXITCODE
-    if ($wslExitCode -ne 0) {
+    }
+    if ($wslResult.ExitCode -ne 0) {
         throw "The WSL setup command failed."
     }
 }
@@ -137,8 +225,8 @@ function Enable-SparseVhd {
     $maxAttempts = 36
     Write-Status "Enabling sparse VHD support for $wslDistro..."
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        & wsl.exe --manage $wslDistro --set-sparse true --allow-unsafe
-        if ($LASTEXITCODE -eq 0) {
+        $sparseResult = Invoke-WslNative -Arguments @("--manage", $wslDistro, "--set-sparse", "true", "--allow-unsafe")
+        if ($sparseResult.ExitCode -eq 0) {
             Complete-RetryProgress
             return
         }
@@ -156,8 +244,8 @@ function Enable-SparseVhd {
 
 function Get-WslDistroVersion {
     $distroPattern = [regex]::Escape($wslDistro)
-    $lines = wsl.exe --list --verbose 2>$null
-    foreach ($line in $lines) {
+    $wslResult = Invoke-WslNative -Arguments @("--list", "--verbose")
+    foreach ($line in $wslResult.Output) {
         $cleanLine = ($line -replace "`0", "")
         if ($cleanLine -match "^\s*\*?\s*$distroPattern\s+\S+\s+(?<version>[12])\s*$") {
             return [int]$Matches.version
@@ -174,8 +262,8 @@ function Set-DistroToWsl2 {
 
     $maxAttempts = 36
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        & wsl.exe --set-version $wslDistro 2
-        if ($LASTEXITCODE -eq 0) {
+        $wslResult = Invoke-WslNative -Arguments @("--set-version", $wslDistro, "2")
+        if ($wslResult.ExitCode -eq 0) {
             Complete-RetryProgress
             return
         }
@@ -191,30 +279,21 @@ function Set-DistroToWsl2 {
     throw "Could not set $wslDistro to WSL version 2 after waiting for the conversion to finish."
 }
 
-function Stop-DockerBeforeDistroTermination {
-    $shutdownScript = @'
-set +e
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop docker.socket docker.service containerd.service >/dev/null 2>&1
-else
-    service docker stop >/dev/null 2>&1
-fi
-
-if pgrep -x dockerd >/dev/null 2>&1; then
-    pkill -TERM -x dockerd
-    for attempt in {1..10}; do
-        pgrep -x dockerd >/dev/null 2>&1 || break
-        sleep 1
-    done
-fi
-
-if ! pgrep -x dockerd >/dev/null 2>&1; then
-    rm -f /var/run/docker.pid
-fi
-'@
-
-    Write-Status "Stopping Docker cleanly before restarting WSL..."
-    Invoke-WslScript -Script $shutdownScript -AsRoot
+function Request-WslPlatformRestart {
+    Write-Status "Installing or enabling the WSL platform and Virtual Machine Platform without launching a Linux distribution..."
+    $platformResult = Invoke-WslNative -Arguments @("--install", "--no-distribution")
+    foreach ($outputLine in $platformResult.Output) {
+        [Console]::Out.WriteLine($outputLine)
+    }
+    if ($platformResult.ExitCode -ne 0) {
+        Write-Status "The WSL platform setup command returned exit code $($platformResult.ExitCode). Review its output above."
+    }
+    if (Test-WindowsRestartRequired -Output $platformResult.Output) {
+        Confirm-WindowsRestart -Reason "Windows reports that the WSL platform changes require a restart."
+    } else {
+        Write-Status "If Windows reports that a restart is required, restart it before running Host mode again."
+    }
+    Write-Status "If this server is a VM, enable nested virtualization in its hypervisor. On a physical server, enable Intel VT-x or AMD-V in firmware."
 }
 
 function Install-HostDependencies {
@@ -223,23 +302,41 @@ function Install-HostDependencies {
     }
 
     Write-Status "Stopping all WSL distributions before host provisioning..."
-    & wsl.exe --shutdown 2>$null
+    $null = Invoke-WslNative -Arguments @("--shutdown")
 
-    $null = wsl.exe --status 2>&1
-    $installCommandRun = $false
-    if ($LASTEXITCODE -ne 0) {
-        Write-Status "WSL is not enabled. Installing WSL2 and Ubuntu without opening an interactive console..."
-        wsl.exe --install --no-launch --distribution $wslDistro
-        $installCommandRun = $true
+    $wslStatus = Invoke-WslNative -Arguments @("--status")
+    if ($wslStatus.ExitCode -ne 0) {
+        Write-Status "WSL platform setup is incomplete. Preparing its required Windows features first."
+        Request-WslPlatformRestart
+        return $false
     }
 
-    if (-not (Get-InstalledDistro) -and -not $installCommandRun) {
+    $installCommandRun = $false
+    $installExitCode = 0
+    if (-not (Get-InstalledDistro)) {
         Write-Status "Ubuntu is not installed. Installing it in WSL without opening an interactive console..."
-        wsl.exe --install --no-launch --distribution $wslDistro
+        $installResult = Invoke-WslNative -Arguments @("--install", "--no-launch", "--distribution", $wslDistro)
+        foreach ($outputLine in $installResult.Output) { [Console]::Out.WriteLine($outputLine) }
+        $installExitCode = $installResult.ExitCode
         $installCommandRun = $true
+
+        if (Test-WindowsRestartRequired -Output $installResult.Output) {
+            Confirm-WindowsRestart -Reason "Windows reports that WSL platform changes require a restart."
+            return $false
+        }
     }
 
     if (-not (Get-InstalledDistro)) {
+        $installFailureText = if ($installResult) { $installResult.Output -join "`n" } else { "" }
+        if ($installFailureText -match '(?i)(HCS_E_HYPERV_NOT_INSTALLED|WSL2 is unable to start|Virtual Machine Platform|virtualization is not enabled)') {
+            Write-Status "Ubuntu could not register because WSL 2 virtualization support is unavailable."
+            Request-WslPlatformRestart
+            return $false
+        }
+        if ($installExitCode -ne 0) {
+            Write-Status "The WSL installation command failed with exit code $installExitCode."
+            return $false
+        }
         Write-Status "$wslDistro is still completing first-run registration. Waiting before continuing..."
         if (Wait-ForInstalledDistro) {
             Write-Status "$wslDistro registration is complete. Continuing with host configuration..."
@@ -256,8 +353,14 @@ function Install-HostDependencies {
     Enable-SparseVhd
 
     Write-Status "Configuring $wslDistro as the default WSL2 distribution..."
-    wsl.exe --set-default $wslDistro
-    wsl.exe --set-default-version 2
+    $wslResult = Invoke-WslNative -Arguments @("--set-default", $wslDistro)
+    if ($wslResult.ExitCode -ne 0) {
+        throw "Could not set Ubuntu as the default WSL distribution."
+    }
+    $wslResult = Invoke-WslNative -Arguments @("--set-default-version", "2")
+    if ($wslResult.ExitCode -ne 0) {
+        throw "Could not set WSL 2 as the default WSL version."
+    }
     Set-DistroToWsl2
 
     $installScript = @'
@@ -267,112 +370,168 @@ WSL_USER="$1"
 export DEBIAN_FRONTEND=noninteractive
 export TERM=dumb
 
-# Use HTTPS for every configured APT source before contacting Ubuntu or Docker repositories.
 find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i 's|http://|https://|g' {} +
+
+echo "Checking for and removing pre-existing Docker/container engine packages and repositories..."
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now docker.socket docker.service containerd.service >/dev/null 2>&1 || true
+else
+    service docker stop >/dev/null 2>&1 || true
+fi
+find /etc/apt/sources.list.d -maxdepth 1 -type f \( -iname '*docker*.list' -o -iname '*docker*.sources' \) -delete
+rm -f /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg /usr/share/keyrings/docker-archive-keyring.gpg
+for package in docker-ce docker-ce-cli docker-ce-rootless-extras docker-buildx-plugin docker-compose-plugin docker-scan-plugin containerd.io containerd docker.io docker-compose docker-compose-v2 docker-doc moby-engine moby-cli; do
+    if dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -qx installed; then
+        apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress::Fancy=0 purge -y "$package"
+    fi
+done
+if getent group docker >/dev/null 2>&1; then
+    gpasswd -d "$WSL_USER" docker >/dev/null 2>&1 || true
+fi
 
 echo "Updating package indexes..."
 apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress::Fancy=0 update
-echo "Installing setup prerequisites..."
-apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress::Fancy=0 install -y ca-certificates curl sudo jq openssh-client
+echo "Installing rootless Podman and WSL prerequisites..."
+apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress::Fancy=0 install -y \
+    ca-certificates curl fuse-overlayfs jq openssh-client podman podman-docker rsync slirp4netns sudo uidmap
 
-if ! (dpkg-query -W -f='${db:Status-Status}' docker-ce 2>/dev/null | grep -qx installed && \
-      dpkg-query -W -f='${db:Status-Status}' docker-ce-cli 2>/dev/null | grep -qx installed); then
-    echo "Adding the Docker CE repository..."
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
-    echo "Updating package indexes with Docker CE..."
-    apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress::Fancy=0 update
-    echo "Installing Docker CE and related components..."
-    apt-get -o Dpkg::Use-Pty=0 -o APT::Color=0 -o APT::Progress::Fancy=0 install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-fi
-
-echo "Configuring Linux user '$WSL_USER' and Docker permissions..."
+echo "Configuring Linux user '$WSL_USER'..."
 if ! id -u "$WSL_USER" >/dev/null 2>&1; then
     useradd --create-home --shell /bin/bash "$WSL_USER"
 fi
-usermod -aG docker "$WSL_USER"
+WSL_HOME="$(getent passwd "$WSL_USER" | cut -d: -f6)"
+install -d -o "$WSL_USER" -g "$(id -gn "$WSL_USER")" "$WSL_HOME"
 echo "$WSL_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$WSL_USER"
 chmod 0440 "/etc/sudoers.d/$WSL_USER"
 
-cat > /etc/wsl.conf <<EOF
-[boot]
-__WSL_BOOT_SETTINGS__
-[user]
-default=$WSL_USER
-EOF
-
-echo "Cleaning stale Docker daemon state..."
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop docker.service docker.socket >/dev/null 2>&1 || true
-fi
-
-if pgrep -x dockerd >/dev/null 2>&1; then
-    pkill -TERM -x dockerd || true
-    for attempt in {1..10}; do
-        pgrep -x dockerd >/dev/null 2>&1 || break
-        sleep 1
-    done
-fi
-
-if pgrep -x dockerd >/dev/null 2>&1; then
-    echo "A Docker daemon process is still running; refusing to remove its PID file."
-    pgrep -a -x dockerd || true
-    exit 1
-fi
-
-if [[ -f /var/run/docker.pid ]]; then
-    echo "Removing stale /var/run/docker.pid..."
-    rm -f /var/run/docker.pid
-fi
-
-echo "Starting Docker CE..."
-if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
-    systemctl enable containerd.service docker.service >/dev/null 2>&1 || true
-    systemctl reset-failed containerd.service docker.service >/dev/null 2>&1 || true
-    systemctl start containerd.service
-    if ! systemctl start docker.service; then
-        echo "Docker CE failed to start. Service details follow:"
-        systemctl status containerd.service --no-pager -l || true
-        journalctl -u containerd.service -n 40 --no-pager || true
-        systemctl status docker.service --no-pager -l || true
-        journalctl -u docker.service -n 80 --no-pager || true
-        exit 1
+add_subid_range() {
+    local database="$1"
+    local option="$2"
+    local next_id end_id
+    if grep -q "^${WSL_USER}:" "$database" 2>/dev/null; then
+        return
     fi
-else
-    if ! service docker start; then
-        echo "Docker CE failed to start. Service details follow:"
-        service docker status || true
-        exit 1
-    fi
-fi
+    next_id="$(awk -F: 'BEGIN { max=99999 } { end=$2+$3-1; if (end>max) max=end } END { print max+1 }' "$database" 2>/dev/null || echo 100000)"
+    end_id=$((next_id + 65535))
+    usermod "$option" "$next_id-$end_id" "$WSL_USER"
+}
+add_subid_range /etc/subuid --add-subuids
+add_subid_range /etc/subgid --add-subgids
 
-if ! docker info >/dev/null 2>&1; then
-    echo "Docker CE service started but docker info failed. Service details follow:"
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl status containerd.service --no-pager -l || true
-        journalctl -u containerd.service -n 40 --no-pager || true
-        systemctl status docker.service --no-pager -l || true
-        journalctl -u docker.service -n 80 --no-pager || true
-    fi
-    exit 1
+WSL_CONF_SOURCE=/etc/wsl.conf
+if [[ ! -f "$WSL_CONF_SOURCE" ]]; then
+    WSL_CONF_SOURCE=/dev/null
 fi
+WSL_CONF_TEMP="$(mktemp /etc/wsl.conf.XXXXXX)"
+awk -v default_user="$WSL_USER" '
+    function finish_section() {
+        if (section == "[boot]" && !boot_setting) {
+            print "systemd=true"
+            boot_setting=1
+        }
+        if (section == "[user]" && !user_setting) {
+            print "default=" default_user
+            user_setting=1
+        }
+    }
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+        finish_section()
+        section=tolower($0)
+        gsub(/[[:space:]]/, "", section)
+        if (section == "[boot]") boot_section=1
+        if (section == "[user]") user_section=1
+        print
+        next
+    }
+    section == "[boot]" && /^[[:space:]]*systemd[[:space:]]*=/ {
+        if (!boot_setting) print "systemd=true"
+        boot_setting=1
+        next
+    }
+    section == "[user]" && /^[[:space:]]*default[[:space:]]*=/ {
+        if (!user_setting) print "default=" default_user
+        user_setting=1
+        next
+    }
+    { print }
+    END {
+        finish_section()
+        if (!boot_section) print "[boot]\nsystemd=true"
+        if (!user_section) print "[user]\ndefault=" default_user
+    }
+' "$WSL_CONF_SOURCE" > "$WSL_CONF_TEMP"
+chown root:root "$WSL_CONF_TEMP"
+chmod 0644 "$WSL_CONF_TEMP"
+mv -f "$WSL_CONF_TEMP" /etc/wsl.conf
+
+echo "Rootless Podman packages installed. User services will be enabled after WSL restarts with systemd."
 '@
 
-    if (-not $DisableSystemd) {
-        $bootSettings = "systemd=true"
-    } else {
-        $bootSettings = 'command="service docker start"'
-    }
-    $installScript = $installScript.Replace('__WSL_BOOT_SETTINGS__', $bootSettings)
-
-    Write-Status "Running Ubuntu provisioning; Ubuntu package and Docker output will appear below..."
+    Write-Status "Running Ubuntu provisioning for rootless Podman..."
     Invoke-WslScript -Script $installScript -Arguments @($UserName) -AsRoot
-    Stop-DockerBeforeDistroTermination
-    wsl.exe --terminate $wslDistro
-    Write-Status "Host provisioning is complete. Docker CE will start automatically with WSL."
+    $wslResult = Invoke-WslNative -Arguments @("--terminate", $wslDistro)
+    if ($wslResult.ExitCode -ne 0) {
+        throw "Could not restart Ubuntu after enabling systemd."
+    }
+
+    $lingerScript = @'
+set -e
+loginctl enable-linger "$1"
+'@
+    Invoke-WslScript -Script $lingerScript -Arguments @($UserName) -AsRoot
+
+    $socketScript = @'
+set -e
+WSL_UID="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$WSL_UID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+systemctl --user enable --now podman.socket
+podman info --format '{{.Host.Security.Rootless}}' | grep -qx true
+'@
+    Invoke-WslScript -Script $socketScript -LinuxUser $UserName
+    Write-Status "Host provisioning is complete. Rootless Podman containers start through systemd when Ubuntu WSL starts."
     return $true
+}
+
+function Sync-ProjectToWsl {
+    $sourceDirWsl = Get-WslPath $scriptDir
+    $wslHome = Get-WslHomePath $UserName
+    $wslProjectPath = "$wslHome/.local/share/wsl-dev-boxes/$projectName"
+    $arguments = @($sourceDirWsl, $projectName)
+
+    $syncScript = @'
+set -euo pipefail
+SOURCE_DIR="$1"
+PROJECT_NAME="$2"
+WSL_USER="$(id -un)"
+WSL_HOME="$(getent passwd "$WSL_USER" | cut -d: -f6)"
+case "$PROJECT_NAME" in
+    *[!a-zA-Z0-9._-]*|'') echo "ERROR: Invalid project sync directory name." >&2; exit 1 ;;
+esac
+if [[ ! -d "$SOURCE_DIR" ]]; then
+    echo "ERROR: Windows project checkout is not accessible through WSL: $SOURCE_DIR" >&2
+    exit 1
+fi
+DEST="$WSL_HOME/.local/share/wsl-dev-boxes/$PROJECT_NAME"
+MARKER="$DEST/.wsl-devbox-sync"
+if [[ -e "$DEST" && ! -f "$MARKER" ]]; then
+    echo "ERROR: Refusing to sync into an unmarked directory: $DEST" >&2
+    exit 1
+fi
+mkdir -p "$DEST"
+printf 'Managed project sync directory.\n' > "$MARKER"
+rsync -a --delete --exclude='/.git/' --exclude='/.wsl-devbox-sync' "$SOURCE_DIR/" "$DEST/"
+
+# The checkout can live on a Windows drive, where Git or an editor may leave
+# shell scripts and Containerfiles with CRLF endings. Normalize those files
+# before Bash executes them or Podman builds from them.
+find "$DEST" -type f \( -name '*.sh' -o -name '*.bash' -o -name 'Containerfile' \) -exec sed -i 's/\r$//' {} +
+
+printf '%s\n' "$DEST"
+'@
+
+    Invoke-WslScript -Script $syncScript -Arguments $arguments -LinuxUser $UserName
+    return $wslProjectPath
 }
 
 function Configure-WindowsSsh {
@@ -385,7 +544,7 @@ function Configure-WindowsSsh {
     $sshConfigPath = Join-Path $sshPath "config"
     $knownHostsPath = Join-Path $sshPath "known_hosts"
     $keyPath = Join-Path $sshPath "wsl-dev-container-key"
-    $pubKeyPath = Join-Path $sshPath "wsl-dev-container-key.pub"
+    $pubKeyPath = "$keyPath.pub"
     $sourceKeyPath = Join-Path $scriptDir "core_box\keys\wsl-dev-container-key"
     $sourcePubKeyPath = Join-Path $scriptDir "core_box\keys\wsl-dev-container-key.pub"
 
@@ -395,7 +554,6 @@ function Configure-WindowsSsh {
     if (-not (Test-Path -LiteralPath $sourceKeyPath) -or -not (Test-Path -LiteralPath $sourcePubKeyPath)) {
         throw "The repository SSH key pair is missing from core_box\keys."
     }
-
     Copy-Item -LiteralPath $sourceKeyPath -Destination $keyPath -Force
     Copy-Item -LiteralPath $sourcePubKeyPath -Destination $pubKeyPath -Force
 
@@ -403,7 +561,7 @@ function Configure-WindowsSsh {
         New-Item -ItemType File -Path $sshConfigPath -Force | Out-Null
     }
 
-    $hostEntryPattern = "^Host $HostAlias\s*$"
+    $hostEntryPattern = "(?ms)^Host[ `t]+$([regex]::Escape($HostAlias))[ `t]*\r?\n.*?(?=^Host[ `t]|\z)"
     $hostEntry = @"
 Host $HostAlias
     HostName localhost
@@ -413,10 +571,15 @@ Host $HostAlias
     IdentitiesOnly yes
 "@
 
-    if (-not (Select-String -Path $sshConfigPath -Pattern $hostEntryPattern -Quiet)) {
-        Add-Content -Path $sshConfigPath -Value "`n$hostEntry`n"
-        Write-Status "Added Windows SSH host '$HostAlias'."
+    $sshConfig = [System.IO.File]::ReadAllText($sshConfigPath)
+    if ([regex]::IsMatch($sshConfig, $hostEntryPattern)) {
+        $hostEntryReplacement = $hostEntry.Replace('$', '$$') + [Environment]::NewLine
+        $sshConfig = [regex]::Replace($sshConfig, $hostEntryPattern, $hostEntryReplacement, 1)
+    } else {
+        $sshConfig += [Environment]::NewLine + $hostEntry + [Environment]::NewLine
     }
+    [System.IO.File]::WriteAllText($sshConfigPath, $sshConfig, [System.Text.UTF8Encoding]::new($false))
+    Write-Status "Updated Windows SSH host '$HostAlias'."
 
     if (Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue) {
         # ssh-keygen returns a nonzero status when this host is not yet in
@@ -433,26 +596,22 @@ Host $HostAlias
 function Get-ConfiguredSshPort {
     param(
         [Parameter(Mandatory=$true)][string]$BoxName,
-        [string]$InstanceName
+        [string]$InstanceName,
+        [Parameter(Mandatory=$true)][string]$WslProjectPath
     )
 
-    $configPath = Join-Path $scriptDir "$BoxName\config.json"
-
+    $configPath = "$WslProjectPath/$BoxName/config.json"
     if ($InstanceName) {
-        $configPath = Join-Path (Split-Path -Parent $configPath) "instances\$InstanceName\config.json"
+        $configPath = "$WslProjectPath/$BoxName/instances/$InstanceName/config.json"
     }
-
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        throw "The SSH port configuration is missing: $configPath"
+    $wslResult = Invoke-WslNative -Arguments @("--distribution", $wslDistro, "--user", $UserName, "--", "jq", "-r", '.ssh_port // empty', $configPath)
+    $portOutput = $wslResult.Output
+    if ($wslResult.ExitCode -ne 0 -or -not $portOutput) {
+        throw "Could not read ssh_port from the WSL project config: $configPath"
     }
-
-    try {
-        $configuration = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-        $configuredPort = [int]$configuration.ssh_port
-    } catch {
-        throw "Could not read ssh_port from $configPath"
+    try { $configuredPort = [int](($portOutput -join "").Trim()) } catch {
+        throw "ssh_port in $configPath must be a number."
     }
-
     if ($configuredPort -lt 1 -or $configuredPort -gt 65535) {
         throw "ssh_port in $configPath must be between 1 and 65535."
     }
@@ -462,12 +621,26 @@ function Get-ConfiguredSshPort {
 if (-not $UserName) {
     throw "UserName is required."
 }
+if ($UserName -notmatch '^[a-z_][a-z0-9_-]*$' -or $UserName -eq "root") {
+    throw "UserName must be a valid non-root Linux username because it is used for rootless Podman."
+}
 
 if ($Mode -eq "Host") {
     if ($Box -or $Instance) {
         throw "Do not specify -Box or -Instance in Host mode."
     }
-    Install-HostDependencies | Out-Null
+    $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $currentPrincipal = New-Object -TypeName System.Security.Principal.WindowsPrincipal -ArgumentList $currentIdentity
+    if (-not $currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Host mode must be run from an elevated Administrator PowerShell window."
+    }
+    $hostSetupOutput = @(Install-HostDependencies)
+    if ($script:HostRestartDeclined) {
+        exit 0
+    }
+    if ($hostSetupOutput.Count -eq 0 -or -not [bool]$hostSetupOutput[-1]) {
+        throw "Host setup did not complete. If WSL requested a Windows restart, restart Windows and run Host mode again."
+    }
     exit 0
 }
 
@@ -487,13 +660,14 @@ if ($Instance -and $Instance -notmatch '^[a-z0-9][a-z0-9_.-]*$') {
     throw "Instance must start with a lowercase letter or number and contain only lowercase letters, numbers, '.', '_' or '-'."
 }
 
-if (-not (Get-InstalledDistro)) {
+$installedDistro = Get-InstalledDistro
+if (-not $installedDistro) {
     throw "Ubuntu is not ready. Run Host mode first: .\setup-wsl-dev-environment.ps1 -Mode Host -UserName $UserName"
 }
 
-$scriptDirWsl = Get-WslPath $scriptDir
+$wslProjectPath = Sync-ProjectToWsl
 $bashArguments = @(
-    "$scriptDirWsl/setup-wsl-dev-environment.sh",
+    "$wslProjectPath/setup-wsl-dev-environment.sh",
     "--username", $UserName,
     "--box", $Box
 )
@@ -512,9 +686,9 @@ if ($Mode -eq "Remove") {
 
 if ($Mode -eq "Update") {
     if ($Instance) {
-        Write-Status "Updating box '$Box' instance '$Instance' inside $wslDistro with Docker CE..."
+        Write-Status "Updating box '$Box' instance '$Instance' with rootless Podman inside $wslDistro..."
     } else {
-        Write-Status "Updating box '$Box' inside $wslDistro with Docker CE..."
+        Write-Status "Updating box '$Box' with rootless Podman inside $wslDistro..."
     }
 } elseif ($Mode -eq "Remove") {
     if ($Instance) {
@@ -524,13 +698,14 @@ if ($Mode -eq "Update") {
     }
 } else {
     if ($Instance) {
-        Write-Status "Starting box '$Box' instance '$Instance' inside $wslDistro with Docker CE..."
+        Write-Status "Creating box '$Box' instance '$Instance' with rootless Podman inside $wslDistro..."
     } else {
-        Write-Status "Starting box '$Box' inside $wslDistro with Docker CE..."
+        Write-Status "Creating box '$Box' with rootless Podman inside $wslDistro..."
     }
 }
-& wsl.exe --distribution $wslDistro -- bash @bashArguments
-$boxExitCode = $LASTEXITCODE
+$wslArguments = @("--distribution", $wslDistro, "--user", $UserName, "--", "bash") + $bashArguments
+$boxResult = Invoke-WslNative -Arguments $wslArguments -StreamOutput
+$boxExitCode = $boxResult.ExitCode
 if ($boxExitCode -eq 2) {
     Write-Status "Box replacement was cancelled. Existing resources were not changed."
     exit 0
@@ -544,7 +719,7 @@ if ($Mode -eq "Remove") {
     exit 0
 }
 
-$sshPort = Get-ConfiguredSshPort -BoxName $Box -InstanceName $Instance
+$sshPort = Get-ConfiguredSshPort -BoxName $Box -InstanceName $Instance -WslProjectPath $wslProjectPath
 $hostAlias = if ($Instance) { "$Box-$Instance" } else { $Box }
 Configure-WindowsSsh -HostAlias $hostAlias -SshPort $sshPort
 if ($Instance) {
